@@ -4,7 +4,6 @@ import { VisibilityChecker } from './VisibilityChecker'
 
 // Helper: create an orthographic camera looking top-down at a given center
 function makeCamera(centerX, centerY, zoom) {
-  // Simulate a typical browser viewport aspect ratio
   const width = 800
   const height = 600
   const halfW = width / 2
@@ -19,54 +18,36 @@ function makeCamera(centerX, centerY, zoom) {
   return camera
 }
 
-// Helper: get the visible world bounds of the camera
-function getCameraWorldBounds(camera) {
-  const halfW = (camera.right - camera.left) / (2 * camera.zoom)
-  const halfH = (camera.top - camera.bottom) / (2 * camera.zoom)
-  return {
-    left: camera.position.x - halfW,
-    right: camera.position.x + halfW,
-    top: camera.position.y + halfH,
-    bottom: camera.position.y - halfH,
-    width: halfW * 2,
-    height: halfH * 2
-  }
-}
 
 const BASE_WORLD_SIZE = 4
 const GAP = 0.5
 
-// Helper: get the expected world-space bounds of an image's content
-// This mirrors processTiles in App.jsx — tiles grow from (x, y) top-left origin
-function getExpectedImageBounds(imageIndex, gridCols, scale = 1, rotation = 0) {
-  const col = imageIndex % gridCols
-  const row = Math.floor(imageIndex / gridCols)
-  const x = col * (BASE_WORLD_SIZE + GAP)
-  const y = -row * (BASE_WORLD_SIZE + GAP)
-  const size = BASE_WORLD_SIZE * scale
+/**
+ * GROUND TRUTH: Uses THREE.Frustum + THREE.Box3, exactly like the old
+ * working VisibilityChecker. This is what the real Three.js rendering
+ * pipeline would produce.
+ */
+function frustumReference(checker, camera) {
+  camera.updateMatrixWorld()
+  const projScreenMatrix = new THREE.Matrix4()
+  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+  const frustum = new THREE.Frustum()
+  frustum.setFromProjectionMatrix(projScreenMatrix)
 
-  if (rotation === 0) {
-    return {
-      minX: x,
-      maxX: x + size,
-      minY: y - size,
-      maxY: y,
-      centerX: x + size / 2,
-      centerY: y - size / 2
+  const box = new THREE.Box3()
+  const visible = []
+
+  for (let i = 0; i < checker.imageCount; i++) {
+    const bounds = checker.getImageBounds(i)
+    box.min.set(bounds.minX, bounds.minY, -0.01)
+    box.max.set(bounds.maxX, bounds.maxY, 0.01)
+
+    if (frustum.intersectsBox(box)) {
+      visible.push(i)
     }
   }
 
-  // For rotated images, the AABB expands
-  const expandFactor = Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation))
-  const boundSize = size * expandFactor
-  return {
-    minX: x + size / 2 - boundSize / 2,
-    maxX: x + size / 2 + boundSize / 2,
-    minY: y - size / 2 - boundSize / 2,
-    maxY: y - size / 2 + boundSize / 2,
-    centerX: x + size / 2,
-    centerY: y - size / 2
-  }
+  return visible
 }
 
 describe('VisibilityChecker', () => {
@@ -76,244 +57,342 @@ describe('VisibilityChecker', () => {
     checker?.dispose()
   })
 
-  describe('basic grid (no rotation, no scale)', () => {
-    it('should see images in the center of the viewport', () => {
-      // 4 images in a 2x2 grid
+  describe('getImageBounds correctness', () => {
+    it('scale=1, no rotation: AABB spans [x, x+size] x [y-size, y]', () => {
       checker = new VisibilityChecker(4, 2, BASE_WORLD_SIZE, GAP)
-      // Camera centered on the grid, zoomed out enough to see everything
-      const camera = makeCamera(
-        (BASE_WORLD_SIZE + GAP) / 2,
-        -(BASE_WORLD_SIZE + GAP) / 2,
-        20
-      )
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toEqual([0, 1, 2, 3])
+
+      const b0 = checker.getImageBounds(0)
+      expect(b0.minX).toBeCloseTo(0)
+      expect(b0.maxX).toBeCloseTo(BASE_WORLD_SIZE)
+      expect(b0.minY).toBeCloseTo(-BASE_WORLD_SIZE)
+      expect(b0.maxY).toBeCloseTo(0)
+
+      const b1 = checker.getImageBounds(1)
+      expect(b1.minX).toBeCloseTo(BASE_WORLD_SIZE + GAP)
+      expect(b1.maxX).toBeCloseTo(2 * BASE_WORLD_SIZE + GAP)
+
+      const b2 = checker.getImageBounds(2)
+      expect(b2.minY).toBeCloseTo(-(BASE_WORLD_SIZE + GAP) - BASE_WORLD_SIZE)
+      expect(b2.maxY).toBeCloseTo(-(BASE_WORLD_SIZE + GAP))
     })
 
-    it('should not see images far from the viewport', () => {
-      // 4 images in a 2x2 grid
+    it('scale=10: AABB spans scaled extent', () => {
+      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, null, [10])
+      const b = checker.getImageBounds(0)
+      expect(b.minX).toBeCloseTo(0)
+      expect(b.maxX).toBeCloseTo(40)
+      expect(b.minY).toBeCloseTo(-40)
+      expect(b.maxY).toBeCloseTo(0)
+    })
+
+    it('rotation=PI/4: center rotates and AABB expands', () => {
+      const rotation = Math.PI / 4
+      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, [rotation])
+      const b = checker.getImageBounds(0)
+
+      const h = BASE_WORLD_SIZE / 2
+      const s = Math.sin(rotation)
+      const c = Math.cos(rotation)
+      const cx = h * (c + s)
+      const cy = h * (s - c)
+      const extent = h * (Math.abs(s) + Math.abs(c))
+
+      expect(b.centerX).toBeCloseTo(cx)
+      expect(b.centerY).toBeCloseTo(cy)
+      expect(b.minX).toBeCloseTo(cx - extent)
+      expect(b.maxX).toBeCloseTo(cx + extent)
+    })
+
+    it('returns null for out-of-range index', () => {
       checker = new VisibilityChecker(4, 2, BASE_WORLD_SIZE, GAP)
-      // Camera far away from all images
-      const camera = makeCamera(1000, 1000, 40)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toEqual([])
-    })
-
-    it('should see only images within camera bounds', () => {
-      // 9 images in a 3x3 grid, tightly zoomed on center image (index 4)
-      checker = new VisibilityChecker(9, 3, BASE_WORLD_SIZE, GAP)
-
-      // Image 4 is at col=1, row=1 → x=4.5, y=-4.5 → center at (6.5, -6.5)
-      const centerX = 1 * (BASE_WORLD_SIZE + GAP) + BASE_WORLD_SIZE / 2
-      const centerY = -1 * (BASE_WORLD_SIZE + GAP) - BASE_WORLD_SIZE / 2
-      // Zoom high enough that only the center image fits
-      const camera = makeCamera(centerX, centerY, 200)
-      const bounds = getCameraWorldBounds(camera)
-
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(4)
-      // At zoom 200 on 800x600, world view is 4x3 — only image 4 should be fully in view
-      // Adjacent images may be partially visible depending on exact overlap
+      expect(checker.getImageBounds(-1)).toBeNull()
+      expect(checker.getImageBounds(4)).toBeNull()
     })
   })
 
-  describe('with scale', () => {
-    it('scaled image bounding box should cover its full scaled extent', () => {
-      // Single image, scale 10x → occupies 40x40 world units
-      const scales = [10]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, null, scales)
-
-      // The image content spans from (0,0) to (40, -40)
-      // Camera at the far edge of the scaled image should still see it
-      const camera = makeCamera(35, -35, 40)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(0)
-    })
-
-    it('camera past the scaled extent should NOT see the image', () => {
-      const scales = [10]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, null, scales)
-
-      // Way past the 40x40 extent
-      const camera = makeCamera(100, -100, 40)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toEqual([])
-    })
-
-    it('camera at origin should see a scale-1 image but not a far scale-1 image', () => {
-      // 2 images in 2 columns: image 0 at x=0, image 1 at x=4.5
-      const scales = [1, 1]
-      checker = new VisibilityChecker(2, 2, BASE_WORLD_SIZE, GAP, null, scales)
-
-      // Camera tightly on image 0 — zoom high enough to exclude image 1
-      const camera = makeCamera(2, -2, 400)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(0)
-      expect(visible).not.toContain(1)
-    })
-
-    it('mixed scales: small camera view should see nearby scale-10 image edge', () => {
-      // image 0: scale 10 (spans 0..40, 0..-40), image 1: scale 1 (at col=1)
-      const scales = [10, 1]
-      checker = new VisibilityChecker(2, 2, BASE_WORLD_SIZE, GAP, null, scales)
-
-      // Camera at (30, -30) — well within the 10x image bounds, far from image 1
-      const camera = makeCamera(30, -30, 100)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(0)
-      expect(visible).not.toContain(1)
-    })
-  })
-
-  describe('with rotation', () => {
-    it('rotated image should have expanded AABB', () => {
-      const rotation = Math.PI / 4 // 45 degrees
-      const rotations = [rotation]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations)
-
-      // The expanded AABB for a 4x4 square at 45deg is ~5.66x5.66
-      const expandFactor = Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation))
-      const boundSize = BASE_WORLD_SIZE * expandFactor
-
-      // Camera at the corner of the expanded bound — should still be visible
-      const camera = makeCamera(boundSize - 0.5, -0.5, 100)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(0)
-    })
-
-    it('should not see rotated image when camera is past the expanded AABB', () => {
-      const rotation = Math.PI / 4
-      const rotations = [rotation]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations)
-
-      const expandFactor = Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation))
-      const boundSize = BASE_WORLD_SIZE * expandFactor
-
-      // Camera well past the expanded bound
-      const camera = makeCamera(boundSize + 20, 20, 100)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toEqual([])
-    })
-  })
-
-  describe('with rotation AND scale', () => {
-    it('scaled + rotated image should have correctly positioned expanded AABB', () => {
-      const rotation = Math.PI / 4
-      const scale = 10
-      const rotations = [rotation]
-      const scales = [scale]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations, scales)
-
-      // Content center: (28.28, 0), AABB size ≈ 56.57
-      // AABB X: 0..56.57, Y: -28.28..28.28
-      // Camera at (50, -20) is within those bounds
-      const camera = makeCamera(50, -20, 40)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toContain(0)
-    })
-
-    it('should not see scaled+rotated image when camera is past its AABB', () => {
-      const rotation = Math.PI / 4
-      const scale = 10
-      const rotations = [rotation]
-      const scales = [scale]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations, scales)
-
-      // Way past any reasonable bound
-      const camera = makeCamera(200, -200, 40)
-      const visible = checker.getVisibleImages(camera)
-      expect(visible).toEqual([])
-    })
-  })
-
-  describe('bounding box position matches tile content position', () => {
-    // This is the critical test: the VisibilityChecker's AABB center must match
-    // where processTiles actually places the content.
-    // In processTiles, tiles grow from image origin (x, y) with localX in [0, worldSize*scale].
-    // So content center is at (x + worldSize*scale/2, y - worldSize*scale/2).
-
-    it('scale=1, no rotation: AABB center should be at grid center', () => {
+  describe('getCameraBounds matches THREE.Frustum world bounds', () => {
+    // Verify that getCameraBounds produces the same visible world rectangle
+    // as the Three.js frustum planes would define.
+    it('should match frustum at various positions and zoom levels', () => {
       checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP)
-      const plane = checker.planes[0]
 
-      // Image origin is (0, 0), content spans (0,0) to (4,-4), center at (2, -2)
-      expect(plane.position.x).toBeCloseTo(2)
-      expect(plane.position.y).toBeCloseTo(-2)
-    })
+      const cases = [
+        { cx: 0, cy: 0, zoom: 1 },
+        { cx: 0, cy: 0, zoom: 40 },
+        { cx: 0, cy: 0, zoom: 400 },
+        { cx: 0, cy: 0, zoom: 1000 },
+        { cx: 10, cy: -10, zoom: 40 },
+        { cx: 20.25, cy: -20.25, zoom: 40 },
+        { cx: -50, cy: 100, zoom: 10 },
+        { cx: 100, cy: -200, zoom: 5 },
+      ]
 
-    it('scale=10, no rotation: AABB center should be at scaled content center', () => {
-      const scales = [10]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, null, scales)
-      const plane = checker.planes[0]
+      for (const { cx, cy, zoom } of cases) {
+        const camera = makeCamera(cx, cy, zoom)
+        const computed = checker.getCameraBounds(camera)
 
-      // Content spans (0,0) to (40,-40), center at (20, -20)
-      expect(plane.position.x).toBeCloseTo(20)
-      expect(plane.position.y).toBeCloseTo(-20)
-    })
+        // Extract frustum bounds via Three.js unproject (ground truth)
+        const mat = new THREE.Matrix4()
+        mat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
+        mat.invert()
+        const bl = new THREE.Vector3(-1, -1, 0).applyMatrix4(mat)
+        const tr = new THREE.Vector3(1, 1, 0).applyMatrix4(mat)
 
-    it('scale=10, second row: AABB center accounts for grid offset + scale', () => {
-      // Image at index 2 in 2-col grid → col=0, row=1 → origin at (0, -4.5)
-      const scales = [1, 1, 10, 1]
-      checker = new VisibilityChecker(4, 2, BASE_WORLD_SIZE, GAP, null, scales)
-      const plane = checker.planes[2]
-
-      const originX = 0  // col=0
-      const originY = -(BASE_WORLD_SIZE + GAP)  // row=1 → -4.5
-      const boundSize = BASE_WORLD_SIZE * 10  // 40
-      expect(plane.position.x).toBeCloseTo(originX + boundSize / 2)  // 20
-      expect(plane.position.y).toBeCloseTo(originY - boundSize / 2)  // -24.5
-    })
-
-    it('scale=1, rotation=PI/4: AABB center should match rotated content center', () => {
-      const rotation = Math.PI / 4
-      const rotations = [rotation]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations)
-      const plane = checker.planes[0]
-
-      // Content center before rotation is (s/2, -s/2) = (2, -2).
-      // After rotating around origin: (2*cos+2*sin, 2*sin-2*cos) = (2.828, 0)
-      const s = BASE_WORLD_SIZE
-      const cos = Math.cos(rotation)
-      const sin = Math.sin(rotation)
-      const expectedCenterX = s / 2 * (cos + sin)  // ≈ 2.828
-      const expectedCenterY = s / 2 * (sin - cos)  // ≈ 0
-      expect(plane.position.x).toBeCloseTo(expectedCenterX)
-      expect(plane.position.y).toBeCloseTo(expectedCenterY)
-    })
-
-    it('scale=10, rotation=PI/4: AABB center should match rotated scaled content center', () => {
-      const rotation = Math.PI / 4
-      const scale = 10
-      const rotations = [rotation]
-      const scales = [scale]
-      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, rotations, scales)
-      const plane = checker.planes[0]
-
-      // Content center before rotation is (20, -20).
-      // After rotating around origin: (20*cos+20*sin, 20*sin-20*cos) = (28.28, 0)
-      const s = BASE_WORLD_SIZE * scale
-      const cos = Math.cos(rotation)
-      const sin = Math.sin(rotation)
-      const expectedCenterX = s / 2 * (cos + sin)
-      const expectedCenterY = s / 2 * (sin - cos)
-      expect(plane.position.x).toBeCloseTo(expectedCenterX)
-      expect(plane.position.y).toBeCloseTo(expectedCenterY)
+        expect(computed.minX).toBeCloseTo(Math.min(bl.x, tr.x), 4)
+        expect(computed.maxX).toBeCloseTo(Math.max(bl.x, tr.x), 4)
+        expect(computed.minY).toBeCloseTo(Math.min(bl.y, tr.y), 4)
+        expect(computed.maxY).toBeCloseTo(Math.max(bl.y, tr.y), 4)
+      }
     })
   })
 
-  describe('zoom levels', () => {
-    it('zoomed out should see more images', () => {
+  describe('getVisibleImages matches THREE.Frustum ground truth', () => {
+    // THE critical test suite: our optimized method must produce EXACTLY
+    // the same results as THREE.Frustum.intersectsBox for every scenario.
+
+    describe('simple grid (no rotation, no scale)', () => {
+      it('camera at grid center, various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP)
+        const stride = BASE_WORLD_SIZE + GAP
+        const cx = 4.5 * stride + BASE_WORLD_SIZE / 2
+        const cy = -4.5 * stride - BASE_WORLD_SIZE / 2
+
+        for (const zoom of [1, 5, 10, 20, 40, 80, 160, 400, 1000]) {
+          const camera = makeCamera(cx, cy, zoom)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+
+      it('camera at various positions, zoom=40', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP)
+        const stride = BASE_WORLD_SIZE + GAP
+
+        const positions = [
+          [0, 0],
+          [2, -2],
+          [stride * 9 + 2, -stride * 9 - 2],
+          [stride * 4.5, -stride * 4.5],
+          [-10, 10],
+          [stride * 12, -stride * 12],
+          [stride * 5, 0],
+          [0, -stride * 5],
+        ]
+
+        for (const [px, py] of positions) {
+          const camera = makeCamera(px, py, 40)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+
+      it('every image center at various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP)
+
+        for (const zoom of [1, 40, 200, 1000]) {
+          for (let i = 0; i < 100; i++) {
+            const b = checker.getImageBounds(i)
+            const camera = makeCamera(b.centerX, b.centerY, zoom)
+            const actual = checker.getVisibleImages(camera)
+            const expected = frustumReference(checker, camera)
+            expect(actual).toEqual(expected)
+          }
+        }
+      })
+    })
+
+    describe('with mixed scales', () => {
+      const scales100 = Array.from({ length: 100 }, (_, i) => (i % 40 === 0) ? 10 : 1)
+
+      it('camera at grid center, various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, null, scales100)
+        const stride = BASE_WORLD_SIZE + GAP
+        const cx = 4.5 * stride + BASE_WORLD_SIZE / 2
+        const cy = -4.5 * stride - BASE_WORLD_SIZE / 2
+
+        for (const zoom of [1, 5, 10, 20, 40, 80, 160, 400]) {
+          const camera = makeCamera(cx, cy, zoom)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+
+      it('camera near scale-10 image edges', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, null, scales100)
+
+        const positions = [
+          [5, -5], [20, -20], [35, -35], [38, -38],
+        ]
+        for (const [px, py] of positions) {
+          for (const zoom of [10, 40, 100, 400]) {
+            const camera = makeCamera(px, py, zoom)
+            expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+          }
+        }
+      })
+
+      it('every image center at zoom=40', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, null, scales100)
+
+        for (let i = 0; i < 100; i++) {
+          const b = checker.getImageBounds(i)
+          const camera = makeCamera(b.centerX, b.centerY, 40)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+    })
+
+    describe('with mixed rotations', () => {
+      const rotations100 = Array.from({ length: 100 }, (_, i) => (i % 10 === 0) ? Math.PI / 4 : 0)
+
+      it('camera at grid center, various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, rotations100)
+        const stride = BASE_WORLD_SIZE + GAP
+        const cx = 4.5 * stride + BASE_WORLD_SIZE / 2
+        const cy = -4.5 * stride - BASE_WORLD_SIZE / 2
+
+        for (const zoom of [1, 10, 40, 100, 400]) {
+          const camera = makeCamera(cx, cy, zoom)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+    })
+
+    describe('full app config (rotations + scales)', () => {
+      const rotations100 = Array.from({ length: 100 }, (_, i) => (i % 10 === 0) ? Math.PI / 4 : 0)
+      const scales100 = Array.from({ length: 100 }, (_, i) => (i % 40 === 0) ? 10 : 1)
+
+      it('camera at grid center, various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, rotations100, scales100)
+        const stride = BASE_WORLD_SIZE + GAP
+        const cx = 4.5 * stride + BASE_WORLD_SIZE / 2
+        const cy = -4.5 * stride - BASE_WORLD_SIZE / 2
+
+        for (const zoom of [1, 5, 10, 20, 40, 80, 160, 400]) {
+          const camera = makeCamera(cx, cy, zoom)
+          expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+        }
+      })
+
+      it('camera at various positions, various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, rotations100, scales100)
+        const stride = BASE_WORLD_SIZE + GAP
+
+        const positions = [
+          [0, 0],
+          [stride * 4.5, -stride * 4.5],
+          [30, -15],
+          [50, -5],
+          [stride * 2, -stride * 7],
+          [-5, -5],
+          [stride * 9, -stride * 9],
+        ]
+
+        for (const [px, py] of positions) {
+          for (const zoom of [1, 10, 40, 100, 400]) {
+            const camera = makeCamera(px, py, zoom)
+            expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+          }
+        }
+      })
+
+      it('every image center at various zoom levels', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, rotations100, scales100)
+
+        for (const zoom of [1, 10, 40, 200, 1000]) {
+          for (let i = 0; i < 100; i++) {
+            const b = checker.getImageBounds(i)
+            const camera = makeCamera(b.centerX, b.centerY, zoom)
+            expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+          }
+        }
+      })
+
+      it('camera at origin zoom=40 (initial R3F state)', () => {
+        checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP, rotations100, scales100)
+        const camera = makeCamera(0, 0, 40)
+        const actual = checker.getVisibleImages(camera)
+        const expected = frustumReference(checker, camera)
+        expect(actual).toEqual(expected)
+        expect(actual).toContain(0)
+      })
+    })
+  })
+
+  describe('isImageVisible agrees with getVisibleImages', () => {
+    it('consistent for all images at various cameras', () => {
+      const rotations = Array.from({ length: 16 }, (_, i) => (i % 4 === 0) ? Math.PI / 4 : 0)
+      const scales = Array.from({ length: 16 }, (_, i) => (i % 8 === 0) ? 5 : 1)
+      checker = new VisibilityChecker(16, 4, BASE_WORLD_SIZE, GAP, rotations, scales)
+
+      const cameras = [
+        makeCamera(0, 0, 40),
+        makeCamera(10, -10, 40),
+        makeCamera(2, -2, 200),
+        makeCamera(0, 0, 5),
+      ]
+
+      for (const camera of cameras) {
+        const visibleSet = new Set(checker.getVisibleImages(camera))
+        for (let i = 0; i < 16; i++) {
+          expect(checker.isImageVisible(i, camera)).toBe(visibleSet.has(i))
+        }
+      }
+    })
+  })
+
+  describe('edge cases', () => {
+    it('single image grid', () => {
+      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP)
+      const camera = makeCamera(2, -2, 40)
+      expect(checker.getVisibleImages(camera)).toEqual(frustumReference(checker, camera))
+    })
+
+    it('camera far from grid sees nothing', () => {
+      checker = new VisibilityChecker(4, 2, BASE_WORLD_SIZE, GAP)
+      const camera = makeCamera(1000, 1000, 40)
+      expect(checker.getVisibleImages(camera)).toEqual([])
+    })
+
+    it('zoomed out sees more than zoomed in', () => {
       checker = new VisibilityChecker(16, 4, BASE_WORLD_SIZE, GAP)
-      const centerX = 1.5 * (BASE_WORLD_SIZE + GAP) + BASE_WORLD_SIZE / 2
-      const centerY = -1.5 * (BASE_WORLD_SIZE + GAP) - BASE_WORLD_SIZE / 2
+      const stride = BASE_WORLD_SIZE + GAP
+      const cx = 1.5 * stride + BASE_WORLD_SIZE / 2
+      const cy = -1.5 * stride - BASE_WORLD_SIZE / 2
 
-      const zoomedOut = makeCamera(centerX, centerY, 10)
-      const zoomedIn = makeCamera(centerX, centerY, 200)
-
-      const visibleOut = checker.getVisibleImages(zoomedOut)
-      const visibleIn = checker.getVisibleImages(zoomedIn)
-
+      const visibleOut = checker.getVisibleImages(makeCamera(cx, cy, 10))
+      const visibleIn = checker.getVisibleImages(makeCamera(cx, cy, 200))
       expect(visibleOut.length).toBeGreaterThan(visibleIn.length)
+    })
+
+    it('updateScales changes visibility', () => {
+      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP, null, [1])
+      const camera = makeCamera(30, -30, 100)
+      expect(checker.getVisibleImages(camera)).toEqual([])
+
+      checker.updateScales([10])
+      expect(checker.getVisibleImages(camera)).toContain(0)
+    })
+
+    it('updateRotations changes bounds', () => {
+      checker = new VisibilityChecker(1, 1, BASE_WORLD_SIZE, GAP)
+      const b1 = checker.getImageBounds(0)
+      checker.updateRotations([Math.PI / 4])
+      const b2 = checker.getImageBounds(0)
+      expect(b2.maxX - b2.minX).toBeGreaterThan(b1.maxX - b1.minX)
+    })
+
+    it('isImageVisible returns false for out-of-range', () => {
+      checker = new VisibilityChecker(4, 2, BASE_WORLD_SIZE, GAP)
+      const camera = makeCamera(0, 0, 40)
+      expect(checker.isImageVisible(-1, camera)).toBe(false)
+      expect(checker.isImageVisible(4, camera)).toBe(false)
+    })
+
+    it('results are sorted by index', () => {
+      checker = new VisibilityChecker(100, 10, BASE_WORLD_SIZE, GAP)
+      const camera = makeCamera(20, -20, 20)
+      const visible = checker.getVisibleImages(camera)
+      for (let i = 1; i < visible.length; i++) {
+        expect(visible[i]).toBeGreaterThan(visible[i - 1])
+      }
     })
   })
 })

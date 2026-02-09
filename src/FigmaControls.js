@@ -1,57 +1,68 @@
-import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import * as THREE from 'three'
 
-export class FigmaControls extends MapControls {
+export class FigmaControls {
   constructor(camera, domElement) {
-    super(camera, domElement)
+    this.camera = camera
+    this.domElement = domElement
+    this.enabled = true
+    this.zoomSpeed = 1
+    this.minZoom = 0.1
+    this.maxZoom = Infinity
 
-    // Override the default wheel handler
     this._onWheel = this._onWheel.bind(this)
-
-    // Remove the original wheel listener and add our custom one
-    domElement.removeEventListener('wheel', this._onMouseWheel)
     domElement.addEventListener('wheel', this._onWheel, { passive: false })
   }
 
   _onWheel(event) {
-    if (this.enabled === false) return
-
+    if (!this.enabled) return
     event.preventDefault()
 
-    // Pinch gesture (zoom) - ctrlKey is true for trackpad pinch on macOS/Chrome
     if (event.ctrlKey || event.metaKey) {
-      if (this.enableZoom === false) return
-
-      this._handlePinchZoom(event)
+      this._handleZoom(event)
     } else {
-      // Two-finger scroll (pan)
-      if (this.enablePan === false) return
-
-      this._handleTrackpadPan(event)
+      this._handlePan(event)
     }
   }
 
-  _handlePinchZoom(event) {
-    this._updateZoomParameters(event.clientX, event.clientY)
+  _handlePan(event) {
+    const scale = 1 / this.camera.zoom
+    this.camera.position.x += event.deltaX * scale
+    this.camera.position.y -= event.deltaY * scale
+    this.update()
+  }
 
-    const zoomSpeed = 20
-    const delta = event.deltaY * zoomSpeed
+  _handleZoom(event) {
+    const camera = this.camera
 
-    if (delta < 0) {
-      this._dollyIn(this._getZoomScale(delta))
-    } else if (delta > 0) {
-      this._dollyOut(this._getZoomScale(delta))
-    }
+    // Get cursor position in NDC before zoom
+    const rect = this.domElement.getBoundingClientRect()
+    const ndcX = ((event.clientX - rect.left) / rect.width) * 2 - 1
+    const ndcY = -((event.clientY - rect.top) / rect.height) * 2 + 1
+
+    // Unproject cursor to world space before zoom
+    const before = new THREE.Vector3(ndcX, ndcY, 0).unproject(camera)
+
+    // Apply zoom
+    const factor = Math.pow(0.95, this.zoomSpeed * event.deltaY * 0.1)
+    camera.zoom = Math.max(this.minZoom, Math.min(this.maxZoom, camera.zoom * factor))
+    camera.updateProjectionMatrix()
+
+    // Unproject cursor to world space after zoom
+    const after = new THREE.Vector3(ndcX, ndcY, 0).unproject(camera)
+
+    // Shift camera so the world point under the cursor stays fixed
+    camera.position.x += before.x - after.x
+    camera.position.y += before.y - after.y
 
     this.update()
   }
 
-  _handleTrackpadPan(event) {
-    this._pan(-event.deltaX, -event.deltaY)
-    this.update()
+  update() {
+    this.camera.updateProjectionMatrix()
+    this.camera.updateMatrixWorld()
   }
 
   dispose() {
     this.domElement.removeEventListener('wheel', this._onWheel)
-    super.dispose()
   }
 }

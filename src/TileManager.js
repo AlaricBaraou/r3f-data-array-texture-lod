@@ -1,9 +1,10 @@
 import * as THREE from 'three'
+import { SlotAllocator } from './SlotAllocator'
 
 const TILE_SIZE = 256
 const ATLAS_SIZE = 4096 // Each layer is 4096x4096
 const TILES_PER_LAYER = ATLAS_SIZE / TILE_SIZE // 16x16 = 256 tiles per layer
-const MAX_LAYERS = 16 // 8 layers × 256 tiles = 2,048 tile slots (~512MB)
+const MAX_LAYERS = 16 // 16 layers × 256 tiles = 4,096 tile slots
 const MAX_INSTANCES = MAX_LAYERS * TILES_PER_LAYER * TILES_PER_LAYER
 
 const vertexShader = /* glsl */ `
@@ -61,11 +62,8 @@ export class TileManager {
     this.renderer = renderer
     this.gl = renderer.getContext()
     this.maxLayers = maxLayers
-    this.tilesPerLayer = TILES_PER_LAYER * TILES_PER_LAYER // 256
 
-    // Track slot usage: layerIndex -> Set of slotIndex (0-255)
-    this.layerSlots = Array.from({ length: maxLayers }, () => new Set())
-    this.usedSlots = new Map() // tileKey -> { layer, slotX, slotY }
+    this.slots = new SlotAllocator(maxLayers, TILES_PER_LAYER)
 
     // Create the DataArrayTexture
     this.tileAtlas = new THREE.DataArrayTexture(
@@ -116,47 +114,19 @@ export class TileManager {
   }
 
   /**
-   * Find a free slot in any layer
-   * @returns {{ layer: number, slotX: number, slotY: number } | null}
-   */
-  findFreeSlot() {
-    for (let layer = 0; layer < this.maxLayers; layer++) {
-      const usedSlots = this.layerSlots[layer]
-      if (usedSlots.size < this.tilesPerLayer) {
-        // Find first free slot
-        for (let i = 0; i < this.tilesPerLayer; i++) {
-          if (!usedSlots.has(i)) {
-            const slotX = i % TILES_PER_LAYER
-            const slotY = Math.floor(i / TILES_PER_LAYER)
-            return { layer, slotX, slotY, slotIndex: i }
-          }
-        }
-      }
-    }
-    return null
-  }
-
-  /**
    * Upload a tile ImageBitmap to the atlas
    * @returns {{ layer: number, slotX: number, slotY: number } | null}
    */
   uploadTile(tileKey, imageBitmap) {
-    // Check if already uploaded
-    if (this.usedSlots.has(tileKey)) {
-      return this.usedSlots.get(tileKey)
-    }
-
-    const slot = this.findFreeSlot()
+    const slot = this.slots.allocate(tileKey)
     if (!slot) {
       console.warn('TileManager: No free slots available')
       return null
     }
 
-    const { layer, slotX, slotY, slotIndex } = slot
-    this.layerSlots[layer].add(slotIndex)
-    this.usedSlots.set(tileKey, { layer, slotX, slotY })
+    const { layer, slotX, slotY } = slot
 
-    // Upload ImageBitmap to the specific slot
+    // Upload ImageBitmap to the specific slot (skip if no WebGL texture yet)
     const texture = this.renderer.properties.get(this.tileAtlas).__webglTexture
     if (texture) {
       const gl = this.gl
@@ -174,7 +144,7 @@ export class TileManager {
       )
     }
 
-    return { layer, slotX, slotY }
+    return slot
   }
 
   /**
@@ -214,6 +184,18 @@ export class TileManager {
     this.mesh.count = this.instances.length
 
     return instanceIndex
+  }
+
+  freeTile(tileKey) {
+    this.slots.free(tileKey)
+  }
+
+  getUsedSlotCount() {
+    return this.slots.getUsedCount()
+  }
+
+  getTotalSlots() {
+    return this.slots.getTotalSlots()
   }
 
   clearInstances() {

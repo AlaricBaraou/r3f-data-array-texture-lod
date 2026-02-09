@@ -3,20 +3,34 @@
 const TILE_SIZE = 256
 const BASE_WORLD_SIZE = 4
 
+// Cache fetched blobs so re-tiling the same image at a different LOD skips the network fetch
+const blobCache = new Map() // url -> { blob, imageWidth, imageHeight }
+
 self.onmessage = async (e) => {
   const { url, imageIndex, lodLevel, id } = e.data
 
   try {
-    // Fetch image
-    self.postMessage({ id, status: 'fetching' })
-    const response = await fetch(url)
-    const blob = await response.blob()
+    let blob, imageWidth, imageHeight
 
-    // Get image dimensions
-    const fullBitmap = await createImageBitmap(blob)
-    const imageWidth = fullBitmap.width
-    const imageHeight = fullBitmap.height
-    fullBitmap.close()
+    const cached = blobCache.get(url)
+    if (cached) {
+      blob = cached.blob
+      imageWidth = cached.imageWidth
+      imageHeight = cached.imageHeight
+    } else {
+      // Fetch image
+      self.postMessage({ id, status: 'fetching' })
+      const response = await fetch(url)
+      blob = await response.blob()
+
+      // Get image dimensions
+      const fullBitmap = await createImageBitmap(blob)
+      imageWidth = fullBitmap.width
+      imageHeight = fullBitmap.height
+      fullBitmap.close()
+
+      blobCache.set(url, { blob, imageWidth, imageHeight })
+    }
 
     // Calculate image world size (maintaining aspect ratio)
     const aspect = imageWidth / imageHeight

@@ -1,140 +1,166 @@
-import * as THREE from 'three'
-
-/**
- * Maintains a shadow scene with placeholder planes for frustum culling checks
- */
 export class VisibilityChecker {
   constructor(imageCount, gridCols, imageWorldSize, gap, rotations = null, scales = null) {
     this.imageCount = imageCount
     this.gridCols = gridCols
     this.imageWorldSize = imageWorldSize
     this.gap = gap
+    this.stride = imageWorldSize + gap
 
-    // Shadow scene for visibility checks
-    this.scene = new THREE.Scene()
-    this.planes = []
+    // State
+    this.rotations = rotations
+    this.scales = scales
 
-    // Frustum for culling
-    this.frustum = new THREE.Frustum()
-    this.projScreenMatrix = new THREE.Matrix4()
+    // Track max scale to determine safe search radius (padding)
+    this.maxScale = 1.0
+    if (scales) this.updateMaxScale()
 
-    // Create placeholder planes for each image
-    const material = new THREE.MeshBasicMaterial({ visible: false })
-
-    for (let i = 0; i < imageCount; i++) {
-      const col = i % gridCols
-      const row = Math.floor(i / gridCols)
-      const x = col * (imageWorldSize + gap)
-      const y = -row * (imageWorldSize + gap)
-
-      const rotation = rotations ? rotations[i] : 0
-      const scale = scales ? scales[i] : 1
-      const contentSize = imageWorldSize * scale
-
-      // For rotated images, expand the bounding box
-      // A rotated square needs a larger AABB
-      const expandFactor = rotation !== 0 ? Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation)) : 1
-      const boundSize = contentSize * expandFactor
-
-      // Content center before rotation (relative to grid origin)
-      const halfSize = contentSize / 2
-      const cos = Math.cos(rotation)
-      const sin = Math.sin(rotation)
-      // Rotate (halfSize, -halfSize) around origin to get actual center
-      const centerOffsetX = halfSize * cos - (-halfSize) * sin
-      const centerOffsetY = halfSize * sin + (-halfSize) * cos
-
-      const geometry = new THREE.PlaneGeometry(boundSize, boundSize)
-      const plane = new THREE.Mesh(geometry, material)
-      plane.position.set(x + centerOffsetX, y + centerOffsetY, 0)
-      plane.userData.imageIndex = i
-
-      // Compute bounding box for frustum checks
-      plane.geometry.computeBoundingBox()
-      plane.updateMatrixWorld()
-
-      this.planes.push(plane)
-      this.scene.add(plane)
-    }
-
-    // Reusable bounding box
-    this.boundingBox = new THREE.Box3()
+    this.baseHalfSize = imageWorldSize / 2
   }
 
-  /**
-   * Update rotations (if they change dynamically)
-   */
   updateRotations(rotations) {
-    for (let i = 0; i < this.planes.length; i++) {
-      const rotation = rotations ? rotations[i] : 0
-      const expandFactor = rotation !== 0 ? Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation)) : 1
-      const boundSize = this.imageWorldSize * expandFactor
+    this.rotations = rotations
+  }
 
-      // Update geometry size
-      const plane = this.planes[i]
-      plane.geometry.dispose()
-      plane.geometry = new THREE.PlaneGeometry(boundSize, boundSize)
-      plane.geometry.computeBoundingBox()
+  updateScales(scales) {
+    this.scales = scales
+    this.updateMaxScale()
+  }
+
+  updateMaxScale() {
+    let max = 1.0
+    if (this.scales) {
+      for (let i = 0; i < this.imageCount; i++) {
+        if (this.scales[i] > max) max = this.scales[i]
+      }
+    }
+    this.maxScale = max
+  }
+
+  /**
+   * Compute the world AABB for a specific image index.
+   */
+  getImageBounds(i) {
+    if (i < 0 || i >= this.imageCount) return null
+
+    const col = i % this.gridCols
+    const row = Math.floor(i / this.gridCols)
+
+    // Pivot (Top-Left of grid cell)
+    const pivotX = col * this.stride
+    const pivotY = -row * this.stride
+
+    // Transform Data
+    const rotation = this.rotations ? this.rotations[i] : 0
+    const scale = this.scales ? this.scales[i] : 1
+
+    // Center Calculation (includes scale)
+    const h = this.baseHalfSize * scale
+
+    const s = Math.sin(rotation)
+    const c = Math.cos(rotation)
+
+    // Rotate the center vector (h, -h)
+    const centerOffsetX = h * c - (-h) * s
+    const centerOffsetY = h * s + (-h) * c
+
+    const centerX = pivotX + centerOffsetX
+    const centerY = pivotY + centerOffsetY
+
+    // Extent (Half-Size of AABB)
+    const extent = h * (Math.abs(s) + Math.abs(c))
+
+    return {
+      minX: centerX - extent,
+      maxX: centerX + extent,
+      minY: centerY - extent,
+      maxY: centerY + extent,
+      centerX,
+      centerY,
+      scale,
+      rotation
     }
   }
 
   /**
-   * Get list of visible image indices based on camera frustum
-   * @param {THREE.Camera} camera
-   * @returns {number[]} Array of visible image indices
+   * Compute the world-space AABB visible to the orthographic camera.
+   * Camera is always looking straight down -Z, so this is just
+   * position +/- half-extents adjusted by zoom.
    */
-  getVisibleImages(camera) {
-    // Update frustum from camera
+  getCameraBounds(camera) {
     camera.updateMatrixWorld()
-    this.projScreenMatrix.multiplyMatrices(
-      camera.projectionMatrix,
-      camera.matrixWorldInverse
-    )
-    this.frustum.setFromProjectionMatrix(this.projScreenMatrix)
+    const halfW = (camera.right - camera.left) / (2 * camera.zoom)
+    const halfH = (camera.top - camera.bottom) / (2 * camera.zoom)
+    const cx = camera.position.x
+    const cy = camera.position.y
+    const EPS = 1e-6
+    return {
+      minX: cx - halfW - EPS,
+      maxX: cx + halfW + EPS,
+      minY: cy - halfH - EPS,
+      maxY: cy + halfH + EPS
+    }
+  }
 
+  getVisibleImages(camera) {
     const visible = []
 
-    for (const plane of this.planes) {
-      // Get world bounding box
-      this.boundingBox.copy(plane.geometry.boundingBox)
-      this.boundingBox.applyMatrix4(plane.matrixWorld)
+    const { minX, maxX, minY, maxY } = this.getCameraBounds(camera)
 
-      if (this.frustum.intersectsBox(this.boundingBox)) {
-        visible.push(plane.userData.imageIndex)
+    // Dynamic Padding based on max possible AABB extent from a grid cell pivot
+    const searchPadding = this.imageWorldSize * this.maxScale * 1.42
+
+    const searchMinX = minX - searchPadding
+    const searchMaxX = maxX + searchPadding
+    const searchMinY = minY - searchPadding
+    const searchMaxY = maxY + searchPadding
+
+    // Grid Traversal
+    const minCol = Math.floor(searchMinX / this.stride)
+    const maxCol = Math.ceil(searchMaxX / this.stride)
+    const minRow = Math.floor(-searchMaxY / this.stride)
+    const maxRow = Math.ceil(-searchMinY / this.stride)
+
+    for (let r = minRow; r <= maxRow; r++) {
+      if (r < 0) continue
+
+      for (let c = minCol; c <= maxCol; c++) {
+        if (c < 0 || c >= this.gridCols) continue
+
+        const i = r * this.gridCols + c
+        if (i < 0 || i >= this.imageCount) continue
+
+        const bounds = this.getImageBounds(i)
+
+        if (
+          bounds.maxX >= minX &&
+          bounds.minX <= maxX &&
+          bounds.maxY >= minY &&
+          bounds.minY <= maxY
+        ) {
+          visible.push(i)
+        }
       }
     }
 
     return visible
   }
 
-  /**
-   * Check if a specific image is visible
-   * @param {number} imageIndex
-   * @param {THREE.Camera} camera
-   * @returns {boolean}
-   */
   isImageVisible(imageIndex, camera) {
-    if (imageIndex < 0 || imageIndex >= this.planes.length) return false
+    if (imageIndex < 0 || imageIndex >= this.imageCount) return false
 
-    camera.updateMatrixWorld()
-    this.projScreenMatrix.multiplyMatrices(
-      camera.projectionMatrix,
-      camera.matrixWorldInverse
+    const { minX, maxX, minY, maxY } = this.getCameraBounds(camera)
+    const bounds = this.getImageBounds(imageIndex)
+
+    return (
+      bounds.maxX >= minX &&
+      bounds.minX <= maxX &&
+      bounds.maxY >= minY &&
+      bounds.minY <= maxY
     )
-    this.frustum.setFromProjectionMatrix(this.projScreenMatrix)
-
-    const plane = this.planes[imageIndex]
-    this.boundingBox.copy(plane.geometry.boundingBox)
-    this.boundingBox.applyMatrix4(plane.matrixWorld)
-
-    return this.frustum.intersectsBox(this.boundingBox)
   }
 
   dispose() {
-    this.planes.forEach(plane => {
-      plane.geometry.dispose()
-      plane.material.dispose()
-    })
-    this.scene.clear()
+    this.rotations = null
+    this.scales = null
   }
 }
