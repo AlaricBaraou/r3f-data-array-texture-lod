@@ -4,7 +4,7 @@ import * as THREE from 'three'
  * Maintains a shadow scene with placeholder planes for frustum culling checks
  */
 export class VisibilityChecker {
-  constructor(imageCount, gridCols, imageWorldSize, gap, rotations = null) {
+  constructor(imageCount, gridCols, imageWorldSize, gap, rotations = null, scales = null) {
     this.imageCount = imageCount
     this.gridCols = gridCols
     this.imageWorldSize = imageWorldSize
@@ -28,15 +28,25 @@ export class VisibilityChecker {
       const y = -row * (imageWorldSize + gap)
 
       const rotation = rotations ? rotations[i] : 0
+      const scale = scales ? scales[i] : 1
+      const contentSize = imageWorldSize * scale
 
       // For rotated images, expand the bounding box
       // A rotated square needs a larger AABB
       const expandFactor = rotation !== 0 ? Math.abs(Math.sin(rotation)) + Math.abs(Math.cos(rotation)) : 1
-      const boundSize = imageWorldSize * expandFactor
+      const boundSize = contentSize * expandFactor
+
+      // Content center before rotation (relative to grid origin)
+      const halfSize = contentSize / 2
+      const cos = Math.cos(rotation)
+      const sin = Math.sin(rotation)
+      // Rotate (halfSize, -halfSize) around origin to get actual center
+      const centerOffsetX = halfSize * cos - (-halfSize) * sin
+      const centerOffsetY = halfSize * sin + (-halfSize) * cos
 
       const geometry = new THREE.PlaneGeometry(boundSize, boundSize)
       const plane = new THREE.Mesh(geometry, material)
-      plane.position.set(x + imageWorldSize / 2, y - imageWorldSize / 2, 0)
+      plane.position.set(x + centerOffsetX, y + centerOffsetY, 0)
       plane.userData.imageIndex = i
 
       // Compute bounding box for frustum checks

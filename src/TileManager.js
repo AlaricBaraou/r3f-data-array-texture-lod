@@ -181,7 +181,8 @@ export class TileManager {
    * Add a tile instance to be rendered
    */
   addInstance(slot, x, y, scaleX = 1, scaleY = 1, rotation = 0) {
-    return this.addInstanceWithZ(slot, x, y, 0, scaleX, scaleY, rotation)
+    const z = this.instances.length * 0.001
+    return this.addInstanceWithZ(slot, x, y, z, scaleX, scaleY, rotation)
   }
 
   /**

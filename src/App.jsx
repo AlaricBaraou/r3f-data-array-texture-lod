@@ -22,6 +22,12 @@ const imageRotations = images.map((_, i) => {
   return (i % 10 === 0) ? Math.PI / 4 : 0
 })
 
+// Per-image scale (some images are larger)
+const imageScales = images.map((_, i) => {
+  // Every 40th image scaled 10x for testing
+  return (i % 40 === 0) ? 10 : 1
+})
+
 // LOD levels
 const MAX_LOD = 4
 const LOD_ZOOM_THRESHOLDS = [0, 80, 160, 320, 640]
@@ -33,6 +39,11 @@ function getLodLevel(zoom) {
     }
   }
   return 0
+}
+
+function getImageLodLevel(zoom, imageIndex) {
+  const effectiveZoom = zoom * (imageScales[imageIndex] || 1)
+  return getLodLevel(effectiveZoom)
 }
 
 // Worker pool
@@ -101,12 +112,15 @@ function processTiles(data, tileManager) {
 
   const { x: imageX, y: imageY } = getImagePosition(imageIndex)
   const rotation = imageRotations[imageIndex] || 0
+  const scale = imageScales[imageIndex] || 1
   const instances = []
 
   // For rotated images, tiles are positioned relative to image center, then rotated
   // First, calculate image center offset
   const cos = Math.cos(rotation)
   const sin = Math.sin(rotation)
+
+  const scaledTileWorldSize = tileWorldSize * scale
 
   for (let i = 0; i < tiles.length; i++) {
     const { tx, ty, tileWorldW, tileWorldH } = tiles[i]
@@ -116,9 +130,12 @@ function processTiles(data, tileManager) {
     const slot = tileManager.uploadTile(tileKey, bitmap)
 
     if (slot) {
+      const scaledW = tileWorldW * scale
+      const scaledH = tileWorldH * scale
+
       // Local position relative to image origin (top-left)
-      const localX = tx * tileWorldSize + tileWorldW / 2
-      const localY = -(ty * tileWorldSize + tileWorldH / 2)
+      const localX = tx * scaledTileWorldSize + scaledW / 2
+      const localY = -(ty * scaledTileWorldSize + scaledH / 2)
 
       // Apply rotation around image origin
       const rotatedX = localX * cos - localY * sin
@@ -132,8 +149,8 @@ function processTiles(data, tileManager) {
         slot,
         worldX,
         worldY,
-        tileWorldW,
-        tileWorldH,
+        tileWorldW: scaledW,
+        tileWorldH: scaledH,
         rotation
       })
     }
@@ -220,7 +237,7 @@ function TileSystem({ onTileCountChange, onVisibleImagesChange, onStatsChange })
   const tileManagerRef = useRef(null)
   const visibilityCheckerRef = useRef(null)
   const tileDataStoreRef = useRef(null)
-  const currentLodRef = useRef(0)
+  const imageLodCacheRef = useRef(new Map())
   const visibleImagesRef = useRef([])
   const needsRebuildRef = useRef(false)
   const initRef = useRef(false)
@@ -238,7 +255,8 @@ function TileSystem({ onTileCountChange, onVisibleImagesChange, onStatsChange })
       GRID_COLS,
       BASE_WORLD_SIZE,
       GAP,
-      imageRotations
+      imageRotations,
+      imageScales
     )
     visibilityCheckerRef.current = visibilityChecker
 
@@ -274,41 +292,66 @@ function TileSystem({ onTileCountChange, onVisibleImagesChange, onStatsChange })
       onVisibleImagesChange?.(visibleImages)
     }
 
-    // Check LOD
+    // Compute per-image LOD based on effective zoom (camera zoom * image scale)
     const zoom = camera.zoom
-    const targetLod = getLodLevel(zoom)
-    const lodChanged = targetLod !== currentLodRef.current
+    const imageLodCache = imageLodCacheRef.current
+    let anyLodChanged = false
 
-    if (lodChanged) {
-      currentLodRef.current = targetLod
+    const perImageLod = new Map()
+    for (const idx of visibleImages) {
+      const targetLod = getImageLodLevel(zoom, idx)
+      perImageLod.set(idx, targetLod)
+
+      if (imageLodCache.get(idx) !== targetLod) {
+        anyLodChanged = true
+        imageLodCache.set(idx, targetLod)
+      }
     }
 
-    // Load tiles for visible images at current LOD if not already loaded
-    const imagesToLoad = visibleImages.filter(
-      idx => !tileDataStore.has(idx, targetLod) && !tileDataStore.isLoading(idx, targetLod)
-    )
+    // Clean stale entries for images no longer visible
+    if (visibilityChanged) {
+      const visibleSet = new Set(visibleImages)
+      for (const idx of imageLodCache.keys()) {
+        if (!visibleSet.has(idx)) {
+          imageLodCache.delete(idx)
+        }
+      }
+    }
 
-    if (imagesToLoad.length > 0) {
-      // Progressive loading - rebuild as each image loads
-      loadImagesAtLod(imagesToLoad, targetLod, tileManager, tileDataStore, () => {
+    // Group images that need loading by their target LOD
+    const loadByLod = new Map()
+    for (const idx of visibleImages) {
+      const targetLod = perImageLod.get(idx)
+      if (!tileDataStore.has(idx, targetLod) && !tileDataStore.isLoading(idx, targetLod)) {
+        if (!loadByLod.has(targetLod)) {
+          loadByLod.set(targetLod, [])
+        }
+        loadByLod.get(targetLod).push(idx)
+      }
+    }
+
+    for (const [lodLevel, imageIndices] of loadByLod) {
+      loadImagesAtLod(imageIndices, lodLevel, tileManager, tileDataStore, () => {
         needsRebuildRef.current = true
       })
     }
 
-    if (visibilityChanged || lodChanged) {
+    if (visibilityChanged || anyLodChanged) {
       needsRebuildRef.current = true
     }
 
     // Rebuild instances if needed
     if (needsRebuildRef.current) {
       needsRebuildRef.current = false
-      rebuildInstances(visibleImages, targetLod, tileManager, tileDataStore)
+      rebuildInstances(visibleImages, perImageLod, tileManager, tileDataStore)
       onTileCountChange?.(tileManager.getTileCount())
 
-      // Stats
+      const lodValues = [...perImageLod.values()]
+      const minLod = lodValues.length > 0 ? Math.min(...lodValues) : 0
+      const maxLod = lodValues.length > 0 ? Math.max(...lodValues) : 0
       const stats = {
         visibleImages: visibleImages.length,
-        currentLod: targetLod,
+        currentLod: minLod === maxLod ? minLod : `${minLod}-${maxLod}`,
         tilesRendered: tileManager.getTileCount()
       }
       onStatsChange?.(stats)
@@ -380,10 +423,11 @@ async function loadImagesAtLod(imageIndices, lodLevel, tileManager, tileDataStor
   await Promise.all(promises)
 }
 
-function rebuildInstances(visibleImages, targetLod, tileManager, tileDataStore) {
+function rebuildInstances(visibleImages, perImageLod, tileManager, tileDataStore) {
   tileManager.clearInstances()
 
   for (const imageIndex of visibleImages) {
+    const targetLod = perImageLod.get(imageIndex) ?? 0
     // Use best available LOD (target or fallback)
     const availableLod = tileDataStore.getBestAvailableLod(imageIndex, targetLod)
     if (availableLod < 0) continue

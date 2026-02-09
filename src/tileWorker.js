@@ -62,6 +62,9 @@ self.onmessage = async (e) => {
         const srcW = Math.round(tileW * pixelsPerWorldX)
         const srcH = Math.round(tileH * pixelsPerWorldY)
 
+        // Skip tiles that resolve to <1 source pixel (e.g. from aspect ratio remainder)
+        if (srcW < 1 || srcH < 1) continue
+
         const promise = createImageBitmap(
           blob,
           srcX,
