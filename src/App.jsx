@@ -4,7 +4,8 @@ import { FigmaControlsComponent } from './FigmaControlsComponent'
 import { TileManager } from './TileManager'
 import { TileDataStore } from './TileDataStore'
 import { VisibilityChecker } from './VisibilityChecker'
-import TileWorker from './tileWorker.js?worker'
+import { getLoaderPool } from './TileLoaderPool'
+import { selectImageLod } from './lodSelection'
 import './App.css'
 
 // Load all images from public folder
@@ -29,98 +30,9 @@ const imageScales = images.map((_, i) => {
   return (i % 40 === 0) ? 10 : 1
 })
 
-// LOD levels
+// LOD config
+const TILE_SIZE = 256
 const MAX_LOD = 4
-const LOD_ZOOM_THRESHOLDS = [0, 80, 160, 320, 640]
-
-function getLodLevel(zoom) {
-  for (let i = MAX_LOD; i >= 0; i--) {
-    if (zoom >= LOD_ZOOM_THRESHOLDS[i]) {
-      return i
-    }
-  }
-  return 0
-}
-
-function getImageLodLevel(zoom, imageIndex) {
-  const effectiveZoom = zoom * (imageScales[imageIndex] || 1)
-  return getLodLevel(effectiveZoom)
-}
-
-// Worker pool — pull-based priority queue (highest LOD dispatched first)
-class TileLoaderPool {
-  constructor(poolSize = 4) {
-    this.workers = Array.from({ length: poolSize }, () => new TileWorker())
-    this.idleWorkers = [...Array(poolSize).keys()]
-    this.queue = [] // kept sorted: highest LOD first
-    this.active = new Map() // id -> { resolve, reject, workerIdx }
-    this.idCounter = 0
-
-    this.workers.forEach((worker, idx) => {
-      worker.onmessage = (e) => {
-        const { id, status } = e.data
-        if (status !== 'done' && status !== 'error') return // ignore intermediate messages
-        const entry = this.active.get(id)
-        if (entry) {
-          if (status === 'done') entry.resolve(e.data)
-          else entry.reject(new Error(e.data.error))
-          this.active.delete(id)
-          this.idleWorkers.push(idx)
-          this._dispatch()
-        }
-      }
-    })
-  }
-
-  _dispatch() {
-    while (this.idleWorkers.length > 0 && this.queue.length > 0) {
-      const task = this.queue.shift()
-      const workerIdx = this.idleWorkers.pop()
-      this.active.set(task.id, { resolve: task.resolve, reject: task.reject, workerIdx })
-      this.workers[workerIdx].postMessage({
-        url: task.url, imageIndex: task.imageIndex, lodLevel: task.lodLevel, id: task.id
-      })
-    }
-  }
-
-  loadImageTiles(url, imageIndex, lodLevel, priority = lodLevel) {
-    return new Promise((resolve, reject) => {
-      const id = this.idCounter++
-      // Insert in priority order (highest first)
-      let i = 0
-      while (i < this.queue.length && this.queue[i].priority >= priority) i++
-      this.queue.splice(i, 0, { id, url, imageIndex, lodLevel, priority, resolve, reject })
-      this._dispatch()
-    })
-  }
-
-  // Cancel queued (not yet dispatched to worker) tasks for an image below a given LOD
-  cancelPending(imageIndex, belowLod) {
-    const kept = []
-    for (const task of this.queue) {
-      if (task.imageIndex === imageIndex && task.lodLevel < belowLod) {
-        task.reject(new Error('cancelled'))
-      } else {
-        kept.push(task)
-      }
-    }
-    this.queue = kept
-  }
-
-  dispose() {
-    for (const task of this.queue) task.reject(new Error('disposed'))
-    this.queue = []
-    this.workers.forEach(w => w.terminate())
-  }
-}
-
-let loaderPool = null
-function getLoaderPool() {
-  if (!loaderPool) {
-    loaderPool = new TileLoaderPool(4)
-  }
-  return loaderPool
-}
 
 function getImagePosition(imageIndex) {
   const col = imageIndex % GRID_COLS
@@ -251,15 +163,15 @@ function TileSystem({ onTileCountChange, onVisibleImagesChange, onStatsChange })
       onVisibleImagesChange?.(visibleImages)
     }
 
-    // Compute per-image LOD based on effective zoom (camera zoom * image scale)
-    const zoom = camera.zoom
+    // Compute per-image LOD — use physical pixel density (zoom × DPR) for sharp rendering
+    const zoom = camera.zoom * gl.getPixelRatio()
     const imageLodCache = imageLodCacheRef.current
     let anyLodChanged = false
 
     const perImageLod = new Map()
     const pool = getLoaderPool()
     for (const idx of visibleImages) {
-      const targetLod = getImageLodLevel(zoom, idx)
+      const targetLod = selectImageLod(zoom, TILE_SIZE, BASE_WORLD_SIZE, MAX_LOD, undefined, imageScales[idx] || 1)
       perImageLod.set(idx, targetLod)
 
       const prevLod = imageLodCache.get(idx)
